@@ -1,0 +1,150 @@
+# On a merge to main that touches the memory server: run the checks, build and
+# push ghcr.io/arbora-partners/mcp-servers/memory, attest its provenance, and
+# publish a GitHub release whose notes record the image digest. IaC pins that
+# digest (README, "How IaC consumes an image"); tags are for humans only.
+name: release memory
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'servers/memory/**'
+      - 'packages/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig.json'
+      - '.dockerignore'
+      # What the checks it runs first read.
+      - 'biome.json'
+      - 'vitest.config.mts'
+      - 'test/**'
+      - '.github/workflows/checks.yml'
+      - '.github/workflows/release-memory.yml'
+  workflow_dispatch:
+
+# Never cancel a running release. GitHub keeps at most one pending run in the
+# group and cancels any older pending one, so of several queued merges only
+# the latest is released; that is accepted, since IaC pins the newest digest.
+concurrency:
+  group: release-memory
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+    permissions:
+      contents: read
+
+  release:
+    needs: checks
+    # workflow_dispatch can name any branch; only main is released.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release and its tag
+      packages: write # push to ghcr
+      id-token: write # sign the provenance attestation
+      attestations: write # store it
+    env:
+      IMAGE: ghcr.io/arbora-partners/mcp-servers/memory
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Idempotent on re-run: one release per commit. If this commit's release
+      # exists, the image it records is already out; building again could
+      # move the tags to a different digest than its notes record, so stop.
+      - name: Check for this commit's release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          tag="memory-${SHA:0:12}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release $tag already exists; nothing to do"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup buildx
+        if: steps.existing.outputs.found == 'false'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr
+        if: steps.existing.outputs.found == 'false'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # linux/amd64 only: Cloud Run's platform. buildx's own provenance is off
+      # so the digest is the image manifest itself, not an index around it;
+      # the attestation below carries the provenance instead.
+      - name: Build and push
+        if: steps.existing.outputs.found == 'false'
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: servers/memory/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Arbora agent memory MCP server
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Attest build provenance
+        if: steps.existing.outputs.found == 'false'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Publish the release
+        if: steps.existing.outputs.found == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ steps.existing.outputs.tag }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+        run: |
+          tag="$TAG"
+          cat > notes.md <<NOTES
+          Memory MCP server image, built from ${SERVER}/${REPO}/commit/${SHA}.
+
+          | | |
+          |---|---|
+          | Image | \`${IMAGE}@${DIGEST}\` |
+          | Digest | \`${DIGEST}\` |
+          | Platform | \`linux/amd64\` |
+
+          Pin it in arbora-partners/IaC by the digest, never by a tag:
+
+          \`\`\`toml
+          digest = "${DIGEST}"
+          \`\`\`
+
+          Verify its provenance with \`gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${REPO}\`.
+          NOTES
+          gh release create "$tag" --repo "$REPO" --target "$SHA" \
+            --title "memory ${SHA:0:12}" --notes-file notes.md --latest

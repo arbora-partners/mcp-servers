@@ -1,0 +1,185 @@
+/**
+ * The shared auth layer: one bearer token per (server, agent), and the token
+ * a request presents is the caller's identity. Nothing downstream takes an
+ * identity from anywhere else.
+ *
+ * The token map is read from an environment object the caller passes in, one
+ * variable per agent (`MCP_TOKEN_<AGENT>`), so each maps one-to-one onto a
+ * Secret Manager secret on Cloud Run. See the README for the contract.
+ */
+import { createHash, timingSafeEqual } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+/** The env-var prefix of a token. The rest of the name is the agent id. */
+const TOKEN_ENV_PREFIX = "MCP_TOKEN_";
+
+/** Shortest token accepted: 32 characters, e.g. 24 random bytes in base64. */
+const MIN_TOKEN_LENGTH = 32;
+
+/** An authenticated caller: the agent id the presented token belongs to. */
+export type AgentId = string & { readonly __brand: "AgentId" };
+
+class TokenConfigError extends Error {
+  override name = "TokenConfigError";
+}
+
+/**
+ * Whether `id` is a kebab slug (`cmo`, `research-2`): lowercase letters and
+ * digits, single hyphens between them. Agent ids end up in graph IRIs and
+ * env-var names, so the alphabet is kept this narrow.
+ */
+function isAgentId(id: string): boolean {
+  if (id.length === 0 || id.startsWith("-") || id.endsWith("-")) return false;
+  let previous = "";
+  for (const c of id) {
+    const alnum = (c >= "a" && c <= "z") || (c >= "0" && c <= "9");
+    if (!alnum && c !== "-") return false;
+    if (c === "-" && previous === "-") return false;
+    previous = c;
+  }
+  return true;
+}
+
+/** `MCP_TOKEN_RESEARCH_2` → `research-2`; undefined when not a token var. */
+function agentIdFromEnvName(name: string): string | undefined {
+  if (!name.startsWith(TOKEN_ENV_PREFIX)) return undefined;
+  const suffix = name.slice(TOKEN_ENV_PREFIX.length);
+  return suffix.toLowerCase().split("_").join("-");
+}
+
+/** The env-var name holding `agent`'s token: `research-2` → `MCP_TOKEN_RESEARCH_2`. */
+function tokenEnvName(agent: string): string {
+  return TOKEN_ENV_PREFIX + agent.toUpperCase().split("-").join("_");
+}
+
+const digest = (token: string): Buffer =>
+  createHash("sha256").update(token, "utf8").digest();
+
+/** Resolves a bearer token to the agent it belongs to. */
+export interface Authenticator {
+  /** The agent whose token this is, or undefined for an unknown one. */
+  identify(token: string): AgentId | undefined;
+}
+
+/**
+ * Builds the authenticator from an environment object (`process.env` in
+ * `main`, a literal in tests). Throws `TokenConfigError` naming every bad
+ * variable, and when no agent is admitted at all: a server that admits nobody
+ * is a misconfiguration, not a quiet state.
+ */
+export function authenticatorFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): Authenticator {
+  const problems: string[] = [];
+  const entries: { agent: AgentId; digest: Buffer }[] = [];
+  const seen = new Map<string, string>();
+
+  for (const name of Object.keys(env).sort()) {
+    const agent = agentIdFromEnvName(name);
+    if (agent === undefined) continue;
+    const token = env[name] ?? "";
+    if (!isAgentId(agent) || tokenEnvName(agent) !== name) {
+      problems.push(
+        `${name}: not MCP_TOKEN_ followed by an agent id in upper snake case`,
+      );
+      continue;
+    }
+    if (token !== token.trim()) {
+      problems.push(`${name}: token has leading or trailing whitespace`);
+      continue;
+    }
+    if (token.length < MIN_TOKEN_LENGTH) {
+      problems.push(
+        `${name}: token shorter than ${MIN_TOKEN_LENGTH} characters`,
+      );
+      continue;
+    }
+    const d = digest(token);
+    const key = d.toString("hex");
+    const other = seen.get(key);
+    if (other !== undefined) {
+      problems.push(
+        `${name}: same token as ${other}; a token must name one agent`,
+      );
+      continue;
+    }
+    seen.set(key, name);
+    entries.push({ agent: agent as AgentId, digest: d });
+  }
+
+  if (problems.length === 0 && entries.length === 0) {
+    problems.push(
+      `no ${TOKEN_ENV_PREFIX}<AGENT> variable is set; the server would admit nobody`,
+    );
+  }
+  if (problems.length > 0) {
+    throw new TokenConfigError(
+      `invalid token configuration:\n  ${problems.join("\n  ")}`,
+    );
+  }
+
+  return {
+    identify(token: string): AgentId | undefined {
+      // Compare digests, so every comparison is over equal-length buffers,
+      // and visit every entry, so the time taken says nothing about which
+      // (if any) matched.
+      const presented = digest(token);
+      let match: AgentId | undefined;
+      for (const entry of entries) {
+        if (timingSafeEqual(presented, entry.digest)) match = entry.agent;
+      }
+      return match;
+    },
+  };
+}
+
+/** The token in an `Authorization: Bearer <token>` header, else undefined. */
+function bearerToken(header: string | undefined): string | undefined {
+  if (header === undefined) return undefined;
+  const space = header.indexOf(" ");
+  if (space < 0) return undefined;
+  if (header.slice(0, space).toLowerCase() !== "bearer") return undefined;
+  const token = header.slice(space + 1).trim();
+  return token.length > 0 ? token : undefined;
+}
+
+type AuthenticatedHandler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  agent: AgentId,
+) => void | Promise<void>;
+
+/**
+ * Wraps a request handler so it runs only for a caller presenting a known
+ * token, and receives that caller's agent id. A missing or unknown token is
+ * answered `401` with a `WWW-Authenticate: Bearer` challenge (RFC 6750) and
+ * never reaches the handler.
+ */
+export function requireAgent(
+  authenticator: Authenticator,
+  realm: string,
+  handler: AuthenticatedHandler,
+): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  return async (req, res) => {
+    const token = bearerToken(req.headers.authorization);
+    const agent =
+      token === undefined ? undefined : authenticator.identify(token);
+    if (agent === undefined) {
+      const error = token === undefined ? "" : ', error="invalid_token"';
+      res.writeHead(401, {
+        "content-type": "application/json",
+        "www-authenticate": `Bearer realm="${realm}"${error}`,
+      });
+      res.end(
+        JSON.stringify({
+          error:
+            token === undefined
+              ? "missing bearer token"
+              : "unknown bearer token",
+        }),
+      );
+      return;
+    }
+    await handler(req, res, agent);
+  };
+}
