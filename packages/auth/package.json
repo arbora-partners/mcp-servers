@@ -1,0 +1,10 @@
+{
+  "name": "@arbora/mcp-auth",
+  "private": true,
+  "description": "Bearer token per agent, resolved to the caller's identity",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

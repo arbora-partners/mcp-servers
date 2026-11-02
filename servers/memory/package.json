@@ -1,0 +1,23 @@
+{
+  "name": "@arbora/mcp-memory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent memory over SPARQL: each agent writes its own named graph and reads them all",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --platform=node --target=node22 --format=esm --outfile=dist/main.mjs --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\""
+  },
+  "dependencies": {
+    "@arbora/mcp-auth": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@rdfjs/data-model": "2.1.2",
+    "@rdfjs/to-ntriples": "3.0.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@rdfjs/types": "2.0.1",
+    "@types/rdfjs__data-model": "2.0.9",
+    "@types/rdfjs__to-ntriples": "3.0.0"
+  }
+}

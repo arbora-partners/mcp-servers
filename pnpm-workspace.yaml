@@ -1,0 +1,14 @@
+packages:
+  - packages/*
+  - servers/*
+
+# pnpm blocks dependency build scripts by default. esbuild needs its install
+# step to link the platform binary: it bundles each server for its image, and
+# vitest's own transform runs on it.
+allowBuilds:
+  esbuild: true
+
+# As in arbora-partners/IaC: a pnpm whose version differs from
+# `packageManager` runs as itself with a warning, rather than downloading a
+# generic-Linux build NixOS cannot run.
+pmOnFail: warn
