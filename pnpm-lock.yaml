@@ -131,13 +131,13 @@ importers:
         version: link:../../packages/auth
       '@modelcontextprotocol/sdk':
         specifier: 1.32.2
-        version: 1.32.2(zod@4.4.3)
+        version: 1.32.2(zod@4.6.6)
       html-to-text:
         specifier: 9.0.5
         version: 9.0.5
       zod:
-        specifier: 4.4.3
-        version: 4.4.3
+        specifier: 4.6.6
+        version: 4.6.6
     devDependencies:
       '@types/html-to-text':
         specifier: 9.0.4
@@ -150,7 +150,7 @@ importers:
         version: link:../../packages/auth
       '@modelcontextprotocol/sdk':
         specifier: 1.32.2
-        version: 1.32.2(zod@4.4.3)
+        version: 1.32.2(zod@4.6.6)
       '@rdfjs/data-model':
         specifier: 2.1.2
         version: 2.1.2
@@ -158,8 +158,8 @@ importers:
         specifier: 3.0.1
         version: 3.0.1
       zod:
-        specifier: 4.4.3
-        version: 4.4.3
+        specifier: 4.6.6
+        version: 4.6.6
     devDependencies:
       '@rdfjs/types':
         specifier: 2.0.1
@@ -1181,8 +1181,8 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
-  zod@4.4.3:
-    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
+  zod@4.6.6:
+    resolution: {integrity: sha512-4UmzQUF5fxvfcYHlbjBmejU+w+hbDnWFx4aS8kBx7nPBHcO2SqPbpAG8snbdg+Xse4pRefR98hgjFgIMCI/UhA==}
 
 snapshots:
 
@@ -1270,7 +1270,7 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.6.0': {}
 
-  '@modelcontextprotocol/sdk@1.32.2(zod@4.4.3)':
+  '@modelcontextprotocol/sdk@1.32.2(zod@4.6.6)':
     dependencies:
       '@hono/node-server': 2.1.5(hono@4.13.16)
       ajv: 8.20.0
@@ -1287,8 +1287,8 @@ snapshots:
       json-schema-typed: 8.0.2
       pkce-challenge: 5.0.1
       raw-body: 3.0.2
-      zod: 4.4.3
-      zod-to-json-schema: 3.25.2(zod@4.4.3)
+      zod: 4.6.6
+      zod-to-json-schema: 3.25.2(zod@4.6.6)
     transitivePeerDependencies:
       - supports-color
 
@@ -2046,8 +2046,8 @@ snapshots:
 
   wrappy@1.0.2: {}
 
-  zod-to-json-schema@3.25.2(zod@4.4.3):
+  zod-to-json-schema@3.25.2(zod@4.6.6):
     dependencies:
-      zod: 4.4.3
+      zod: 4.6.6
 
-  zod@4.4.3: {}
+  zod@4.6.6: {}
