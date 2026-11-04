@@ -29,9 +29,17 @@ test-watch:
 build-memory:
     pnpm --filter @arbora/mcp-memory run build
 
+# Bundle the fetch server to servers/fetch/dist/main.mjs
+build-fetch:
+    pnpm --filter @arbora/mcp-fetch run build
+
 # Build the memory server's image locally, as the release workflow does
 image-memory tag="mcp-memory:local":
     docker build -f servers/memory/Dockerfile -t {{tag}} .
+
+# Build the fetch server's image locally, as the release workflow does
+image-fetch tag="mcp-fetch:local":
+    docker build -f servers/fetch/Dockerfile -t {{tag}} .
 
 # Install dependencies
 install:

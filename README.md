@@ -13,8 +13,9 @@ Licensed under the [Apache License 2.0](LICENSE).
 |------|------|
 | `packages/auth/` | `@arbora/mcp-auth`, the shared auth layer: one bearer token per (server, agent), resolved to the caller's agent id |
 | `servers/memory/` | The memory server ([IaC ADR 0032](https://github.com/arbora-partners/IaC/blob/main/docs/adr/0032-agent-memory-is-oxigraph-on-an-internal-vm-behind-our-own-mcp-server.md)): generic memory tools over Oxigraph |
+| `servers/fetch/` | The fetch server ([agents#43](https://github.com/arbora-partners/agents/issues/43)): public web pages as text, with an SSRF guard |
 | `test/oxigraph.ts` | Test setup: one real Oxigraph container, digest-pinned |
-| `.github/workflows/` | `checks.yml` (every PR and push), `release-memory.yml` (image and release on merge) |
+| `.github/workflows/` | `checks.yml` (every PR and push), `release-memory.yml` and `release-fetch.yml` (image and release on merge) |
 
 ## The memory server
 
@@ -122,6 +123,69 @@ Write the IRIs as the data model above spells them. An entity name is
 percent-encoded as JavaScript's `encodeURIComponent` encodes it. To see what
 is there first, `POST` a `SELECT` to `/query` instead.
 
+## The fetch server
+
+The controlled alternative to Claude Code's `WebFetch`, which cannot be limited
+to a domain under a host that auto-approves every tool not denied
+([agents#43](https://github.com/arbora-partners/agents/issues/43)). Same shape
+as the memory server: **MCP streamable HTTP** at `POST /mcp`, stateless, bearer
+auth from `@arbora/mcp-auth` (realm `fetch`), and `GET /healthz` without a
+token.
+
+### The tool
+
+One tool, `fetch`, with input `{ url: string }`. It returns the page as text;
+HTML is converted to readable text with
+[`html-to-text`](https://github.com/html-to-text/node-html-to-text) (scripts,
+styles and images dropped, link targets kept). A non-text content type is
+refused.
+
+| Rule | Value |
+|------|-------|
+| Scheme, method | `https` only, `GET` only, no credentials in the URL |
+| Port | 443 only |
+| Redirects | at most 3, each hop checked again from the start |
+| Read | at most 1 MB of body; compression is not requested |
+| Returned | at most 100,000 characters; a note at the end says when the page was cut, in bytes or characters |
+| Time | 15 s for the whole fetch, redirects included |
+
+**SSRF guard.** The host is resolved, and the fetch is refused if *any*
+address it resolves to is not public unicast: private, loopback, link-local
+(including `169.254.169.254`), CGNAT, multicast, unspecified, reserved,
+documentation and benchmarking ranges, and for IPv6 unique-local, site-local,
+and every IPv4-mapped, NAT64 and 6to4 form. IP literals in a URL
+(`https://2130706433/` included, which `URL` normalizes) get the same check.
+The connection then goes to the address that was checked, with the host name
+kept for SNI, certificate verification and the `Host` header; nothing is
+resolved twice. The ranges are in `servers/fetch/src/addresses.ts`.
+
+**Load.** At most 8 fetches run at once in a process (`maxInFlight`); the
+next is refused at once with "too many fetches in flight". A JSON-RPC batch
+carrying more than one `tools/call` is refused with `400`, and a caller that
+hangs up aborts its fetch. A URL is at most 8192 characters.
+
+**Audit.** Every call writes one JSON line to stdout with `agent` (from the
+token), `url`, `status`, `bytes`, `duration_ms`, `outcome` (`ok`, `refused`
+or `failed`), plus `final_url` after redirects and `error` on failure (URLs
+longer than 2048 characters are cut in the line). Tokens
+are never logged. The domain allow or deny list from agents#43 is not here
+yet.
+
+### Environment
+
+`MCP_TOKEN_<AGENT>` and `PORT`, exactly as for the memory server. There are
+no other settings. **Sizing:** one fetch holds up to about 1 MB of body plus
+its decoded string and, for HTML, a parse tree, so budget roughly 25 MB per
+fetch in flight: 8 fetches and the Node baseline fit in 512 MiB. Conversion
+runs synchronously, so give the service at least one full vCPU and set Cloud
+Run's per-instance concurrency to 8 or less, so the cap is not what refuses
+agents. The IaC Secret for agent `cio` is `mcp_fetch_cio`, exposed
+as `MCP_TOKEN_CIO`. The service needs egress to the internet and nothing
+internal.
+
+The tests inject DNS and TLS trust as parameters (`FetcherDeps`) and reach a
+local TLS server only; they need `openssl` for a throwaway certificate.
+
 ## Development
 
 The devshell (`nix develop`, or direnv with `.envrc`) provides node, pnpm,
@@ -134,6 +198,7 @@ just lint           # biome check .
 just typecheck      # tsc --noEmit
 just test           # vitest run
 just image-memory   # docker build -f servers/memory/Dockerfile .
+just image-fetch    # docker build -f servers/fetch/Dockerfile .
 ```
 
 The tests drive each server through its MCP interface over streamable HTTP,
@@ -147,8 +212,9 @@ versions arbora-partners/IaC resolves.
 
 ## Releases and how IaC consumes an image
 
-Every merge to `main` that touches the memory server runs the checks and then
-`release-memory.yml`. That workflow:
+Every merge to `main` that touches a server runs the checks and then that
+server's workflow (`release-memory.yml`, `release-fetch.yml`; the text below
+says memory, and fetch is the same with `fetch` for `memory`). The workflow:
 
 1. builds `servers/memory/Dockerfile` for `linux/amd64`;
 2. pushes `ghcr.io/arbora-partners/mcp-servers/memory`, tagged
