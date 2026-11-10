@@ -166,7 +166,8 @@ export type Env = Readonly<Record<string, string | undefined>>;
 
 /**
  * The server as the environment contract configures it (README,
- * "The fetch server"): `MCP_TOKEN_<AGENT>` per admitted agent and an
+ * "The fetch server"): `MCP_TOKEN_<AGENT>` or `MCP_TOKEN_<AGENT>_FILE` per
+ * admitted agent and an
  * optional `PORT` (default 8080). Throws rather than start misconfigured.
  */
 export function fetchHttpServerFromEnv(

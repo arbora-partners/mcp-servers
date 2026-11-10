@@ -78,7 +78,8 @@ wrong, naming each problem:
 
 | Variable | Required | Value |
 |----------|----------|-------|
-| `MCP_TOKEN_<AGENT>` | at least one | The bearer token of agent `<agent>`, one variable per admitted agent. `<AGENT>` is the agent id in upper snake case: `cmo` → `MCP_TOKEN_CMO`, `research-2` → `MCP_TOKEN_RESEARCH_2`. At least 32 characters, and no two agents may share a token. |
+| `MCP_TOKEN_<AGENT>` | at least one, or its `_FILE` form | The bearer token of agent `<agent>`, one variable per admitted agent. `<AGENT>` is the agent id in upper snake case: `cmo` → `MCP_TOKEN_CMO`, `research-2` → `MCP_TOKEN_RESEARCH_2`. At least 32 characters, and no two agents may share a token. |
+| `MCP_TOKEN_<AGENT>_FILE` | instead of `MCP_TOKEN_<AGENT>` | The path of a file holding that token, with no trailing newline. The server reads it at startup and refuses to start if it can't. After that, a request re-reads it once its last read is 30 seconds old (`TOKEN_FILE_TTL_MS`), so a rotated token works, and the old one stops working, within 30 seconds, with no restart. While the file can't be read or holds no valid token, that agent is refused, and the server logs it. An agent has one form or the other, never both, so no agent id ends in `-file`. |
 | `SPARQL_QUERY_URL` | yes | Oxigraph's SPARQL query endpoint, e.g. `http://10.0.0.5:7878/query` |
 | `SPARQL_UPDATE_URL` | yes | Oxigraph's SPARQL update endpoint, e.g. `http://10.0.0.5:7878/update` |
 | `PORT` | no | Listen port, default `8080`. Cloud Run sets it. |
@@ -87,11 +88,15 @@ An agent id is a kebab slug: lowercase letters and digits, single hyphens
 between them. A variable starting `MCP_TOKEN_` that doesn't spell one in upper
 snake case (`MCP_TOKEN_cmo`, `MCP_TOKEN_A__B`) is an error, not ignored.
 
-**For IaC.** Use one variable per agent, so each maps onto one Secret Manager
-secret through Cloud Run's `env[].valueSource.secretKeyRef`. The memory
-server's token for agent `cmo` is the IaC Secret `mcp_memory_cmo`, exposed as
-`MCP_TOKEN_CMO`. Adding or removing an agent is adding or removing a variable,
-then a new revision. A request with no token gets a `401` with
+**For IaC.** Mount each agent's secret as a Cloud Run secret volume at
+`latest`, and name the file in `MCP_TOKEN_<AGENT>_FILE`. Cloud Run reads a
+volume from Secret Manager on every read, so a new version reaches the running
+instance. An env var secret is resolved only when an instance starts
+([IaC#694](https://github.com/arbora-partners/IaC/issues/694)). The memory
+server's token for agent `cmo` is the IaC Secret `mcp_memory_cmo`, mounted at
+`/secrets/mcp_memory_cmo/token` and named by `MCP_TOKEN_CMO_FILE`. Adding or
+removing an agent is adding or removing a volume and its variable, then a new
+revision. A request with no token gets a `401` with
 `WWW-Authenticate: Bearer realm="memory"`, and an unknown token gets the same
 plus `error="invalid_token"`.
 
@@ -173,14 +178,14 @@ yet.
 
 ### Environment
 
-`MCP_TOKEN_<AGENT>` and `PORT`, exactly as for the memory server. There are
+`MCP_TOKEN_<AGENT>` (or `MCP_TOKEN_<AGENT>_FILE`) and `PORT`, exactly as for the memory server. There are
 no other settings. **Sizing:** one fetch holds up to about 1 MB of body plus
 its decoded string and, for HTML, a parse tree, so budget roughly 25 MB per
 fetch in flight: 8 fetches and the Node baseline fit in 512 MiB. Conversion
 runs synchronously, so give the service at least one full vCPU and set Cloud
 Run's per-instance concurrency to 8 or less, so the cap is not what refuses
-agents. The IaC Secret for agent `cio` is `mcp_fetch_cio`, exposed
-as `MCP_TOKEN_CIO`. The service needs egress to the internet and nothing
+agents. The IaC Secret for agent `cio` is `mcp_fetch_cio`, mounted
+as a file named by `MCP_TOKEN_CIO_FILE`. The service needs egress to the internet and nothing
 internal.
 
 The tests inject DNS and TLS trust as parameters (`FetcherDeps`) and reach a
