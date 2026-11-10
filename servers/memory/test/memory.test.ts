@@ -5,7 +5,11 @@
  * is exercised here and nowhere else.
  */
 import { randomBytes, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { TOKEN_FILE_TTL_MS } from "@arbora/mcp-auth";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterAll, beforeAll, describe, expect, inject, it } from "vitest";
@@ -200,6 +204,97 @@ describe("authentication", () => {
     expect(() =>
       memoryHttpServerFromEnv({ ...urls, MCP_TOKEN_CFO: ` ${token()}` }, "t"),
     ).toThrow(/MCP_TOKEN_CFO: token has leading or trailing whitespace/);
+  });
+
+  it("refuses to start on a token file it can't use, or an agent given twice", () => {
+    const urls = {
+      SPARQL_QUERY_URL: `${oxigraph}/query`,
+      SPARQL_UPDATE_URL: `${oxigraph}/update`,
+    };
+    const dir = mkdtempSync(join(tmpdir(), "mcp-tokens-"));
+    try {
+      const missing = join(dir, "missing");
+      expect(() =>
+        memoryHttpServerFromEnv({ ...urls, MCP_TOKEN_CMO_FILE: missing }, "t"),
+      ).toThrow(/MCP_TOKEN_CMO_FILE: cannot read /);
+      const newline = join(dir, "newline");
+      writeFileSync(newline, `${token()}\n`);
+      expect(() =>
+        memoryHttpServerFromEnv({ ...urls, MCP_TOKEN_CMO_FILE: newline }, "t"),
+      ).toThrow(/MCP_TOKEN_CMO_FILE: token has leading or trailing whitespace/);
+      const good = join(dir, "good");
+      writeFileSync(good, token());
+      expect(() =>
+        memoryHttpServerFromEnv(
+          { ...urls, MCP_TOKEN_CMO: token(), MCP_TOKEN_CMO_FILE: good },
+          "t",
+        ),
+      ).toThrow(/MCP_TOKEN_CMO_FILE: agent cmo already has MCP_TOKEN_CMO/);
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+
+  it("follows a rotated token file without a restart, once its read is stale", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mcp-tokens-"));
+    const path = join(dir, "token");
+    const old = token();
+    writeFileSync(path, old);
+    let clock = 0;
+    const { server: rotating } = memoryHttpServerFromEnv(
+      {
+        MCP_TOKEN_CMO_FILE: path,
+        SPARQL_QUERY_URL: `${oxigraph}/query`,
+        SPARQL_UPDATE_URL: `${oxigraph}/update`,
+      },
+      "t",
+      () => clock,
+    );
+    await new Promise<void>((r) => rotating.listen(0, "127.0.0.1", r));
+    const url = `http://127.0.0.1:${(rotating.address() as AddressInfo).port}/mcp`;
+    const status = async (t: string) =>
+      (
+        await fetch(url, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${t}`,
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-03-26",
+              capabilities: {},
+              clientInfo: { name: "rotation-test", version: "0" },
+            },
+          }),
+        })
+      ).status;
+    try {
+      expect(await status(old)).toBe(200);
+
+      const rotated = token();
+      writeFileSync(path, rotated);
+      clock = TOKEN_FILE_TTL_MS - 1;
+      expect(await status(old)).toBe(200);
+      clock = TOKEN_FILE_TTL_MS;
+      expect(await status(old)).toBe(401);
+      expect(await status(rotated)).toBe(200);
+
+      // An unreadable file admits nobody, and a fixed one admits again.
+      rmSync(path);
+      clock = 2 * TOKEN_FILE_TTL_MS;
+      expect(await status(rotated)).toBe(401);
+      writeFileSync(path, rotated);
+      clock = 3 * TOKEN_FILE_TTL_MS;
+      expect(await status(rotated)).toBe(200);
+    } finally {
+      await new Promise((r) => rotating.close(r));
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("serves the health check without a token", async () => {

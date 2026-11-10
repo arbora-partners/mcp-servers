@@ -83,14 +83,16 @@ export type Env = Readonly<Record<string, string | undefined>>;
 
 /**
  * The server as the environment contract configures it (README,
- * "Environment"): `MCP_TOKEN_<AGENT>` per admitted agent, `SPARQL_QUERY_URL`,
- * `SPARQL_UPDATE_URL` and an optional `PORT` (default 8080). `env` is
- * `process.env` in `main` and a literal in tests. Throws, naming every
- * problem, rather than start misconfigured.
+ * "Environment"): `MCP_TOKEN_<AGENT>` or `MCP_TOKEN_<AGENT>_FILE` per admitted
+ * agent, `SPARQL_QUERY_URL`, `SPARQL_UPDATE_URL` and an optional `PORT`
+ * (default 8080). `env` is `process.env` in `main` and a literal in tests, and
+ * `now` times the token files' re-reads. Throws, naming every problem, rather
+ * than start misconfigured.
  */
 export function memoryHttpServerFromEnv(
   env: Env,
   version: string,
+  now: () => number = Date.now,
 ): { server: Server; port: number } {
   const problems: string[] = [];
   const url = (name: string): string => {
@@ -107,7 +109,7 @@ export function memoryHttpServerFromEnv(
   if (problems.length > 0)
     throw new Error(`invalid environment:\n  ${problems.join("\n  ")}`);
   const server = memoryHttpServer({
-    authenticator: authenticatorFromEnv(env),
+    authenticator: authenticatorFromEnv(env, now),
     store: new MemoryStore({ query, update }),
     version,
   });

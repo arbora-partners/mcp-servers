@@ -4,14 +4,28 @@
  * identity from anywhere else.
  *
  * The token map is read from an environment object the caller passes in, one
- * variable per agent (`MCP_TOKEN_<AGENT>`), so each maps one-to-one onto a
- * Secret Manager secret on Cloud Run. See the README for the contract.
+ * variable per agent: `MCP_TOKEN_<AGENT>` holds the token, or
+ * `MCP_TOKEN_<AGENT>_FILE` names a file holding it. A file is re-read once its
+ * last read is `TOKEN_FILE_TTL_MS` old, so a Secret Manager volume mounted at
+ * `latest` makes a rotation take effect without a restart (IaC#694). See the
+ * README for the contract.
  */
 import { createHash, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 /** The env-var prefix of a token. The rest of the name is the agent id. */
 const TOKEN_ENV_PREFIX = "MCP_TOKEN_";
+
+/** The suffix of a variable naming a token file rather than holding a token. */
+const TOKEN_FILE_SUFFIX = "_FILE";
+
+/**
+ * How old a token file's last read may be before a request re-reads it. Each
+ * read of a Secret Manager volume is a Secret Manager access, so files are
+ * not read per request; this bounds how long a rotated-out token still works.
+ */
+export const TOKEN_FILE_TTL_MS = 30_000;
 
 /** Shortest token accepted: 32 characters, e.g. 24 random bytes in base64. */
 const MIN_TOKEN_LENGTH = 32;
@@ -40,11 +54,18 @@ function isAgentId(id: string): boolean {
   return true;
 }
 
-/** `MCP_TOKEN_RESEARCH_2` → `research-2`; undefined when not a token var. */
-function agentIdFromEnvName(name: string): string | undefined {
+/**
+ * `MCP_TOKEN_RESEARCH_2` → `research-2`, `MCP_TOKEN_CMO_FILE` → `cmo` as a
+ * file; undefined when not a token var. So no agent id may end in `-file`.
+ */
+function parseTokenEnvName(
+  name: string,
+): { agent: string; base: string; file: boolean } | undefined {
   if (!name.startsWith(TOKEN_ENV_PREFIX)) return undefined;
-  const suffix = name.slice(TOKEN_ENV_PREFIX.length);
-  return suffix.toLowerCase().split("_").join("-");
+  const file = name.endsWith(TOKEN_FILE_SUFFIX);
+  const base = file ? name.slice(0, -TOKEN_FILE_SUFFIX.length) : name;
+  const suffix = base.slice(TOKEN_ENV_PREFIX.length);
+  return { agent: suffix.toLowerCase().split("_").join("-"), base, file };
 }
 
 /** The env-var name holding `agent`'s token: `research-2` → `MCP_TOKEN_RESEARCH_2`. */
@@ -54,6 +75,37 @@ function tokenEnvName(agent: string): string {
 
 const digest = (token: string): Buffer =>
   createHash("sha256").update(token, "utf8").digest();
+
+/** What is wrong with `token` as a token, or undefined when nothing is. */
+function tokenProblem(token: string): string | undefined {
+  if (token !== token.trim()) return "token has leading or trailing whitespace";
+  if (token.length < MIN_TOKEN_LENGTH)
+    return `token shorter than ${MIN_TOKEN_LENGTH} characters`;
+  return undefined;
+}
+
+/** One admitted agent's token: fixed, or from a file read at `readAt`. */
+interface Entry {
+  agent: AgentId;
+  name: string;
+  /** Undefined while the file is unreadable or holds no valid token. */
+  digest: Buffer | undefined;
+  file?: { path: string; readAt: number };
+}
+
+/** The token in `path`, or the reason it can't be used. */
+function readTokenFile(path: string): { token: string } | { problem: string } {
+  let token: string;
+  try {
+    token = readFileSync(path, "utf8");
+  } catch (error) {
+    return {
+      problem: `cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  const problem = tokenProblem(token);
+  return problem === undefined ? { token } : { problem };
+}
 
 /** Resolves a bearer token to the agent it belongs to. */
 export interface Authenticator {
@@ -65,46 +117,67 @@ export interface Authenticator {
  * Builds the authenticator from an environment object (`process.env` in
  * `main`, a literal in tests). Throws `TokenConfigError` naming every bad
  * variable, and when no agent is admitted at all: a server that admits nobody
- * is a misconfiguration, not a quiet state.
+ * is a misconfiguration, not a quiet state. A token file is read once here,
+ * so a bad one stops the server starting; `now` is the clock its re-reads
+ * are timed by.
  */
 export function authenticatorFromEnv(
   env: Readonly<Record<string, string | undefined>>,
+  now: () => number = Date.now,
 ): Authenticator {
   const problems: string[] = [];
-  const entries: { agent: AgentId; digest: Buffer }[] = [];
+  const entries: Entry[] = [];
   const seen = new Map<string, string>();
+  const agents = new Map<string, string>();
 
   for (const name of Object.keys(env).sort()) {
-    const agent = agentIdFromEnvName(name);
-    if (agent === undefined) continue;
-    const token = env[name] ?? "";
-    if (!isAgentId(agent) || tokenEnvName(agent) !== name) {
+    const parsed = parseTokenEnvName(name);
+    if (parsed === undefined) continue;
+    const { agent, base, file } = parsed;
+    const value = env[name] ?? "";
+    if (!isAgentId(agent) || tokenEnvName(agent) !== base) {
       problems.push(
         `${name}: not MCP_TOKEN_ followed by an agent id in upper snake case`,
       );
       continue;
     }
-    if (token !== token.trim()) {
-      problems.push(`${name}: token has leading or trailing whitespace`);
+    const other = agents.get(agent);
+    if (other !== undefined) {
+      problems.push(`${name}: agent ${agent} already has ${other}`);
       continue;
     }
-    if (token.length < MIN_TOKEN_LENGTH) {
-      problems.push(
-        `${name}: token shorter than ${MIN_TOKEN_LENGTH} characters`,
-      );
-      continue;
+    agents.set(agent, name);
+    let token = value;
+    if (file) {
+      const read = readTokenFile(value);
+      if ("problem" in read) {
+        problems.push(`${name}: ${read.problem}`);
+        continue;
+      }
+      token = read.token;
+    } else {
+      const problem = tokenProblem(token);
+      if (problem !== undefined) {
+        problems.push(`${name}: ${problem}`);
+        continue;
+      }
     }
     const d = digest(token);
     const key = d.toString("hex");
-    const other = seen.get(key);
-    if (other !== undefined) {
+    const twin = seen.get(key);
+    if (twin !== undefined) {
       problems.push(
-        `${name}: same token as ${other}; a token must name one agent`,
+        `${name}: same token as ${twin}; a token must name one agent`,
       );
       continue;
     }
     seen.set(key, name);
-    entries.push({ agent: agent as AgentId, digest: d });
+    entries.push({
+      agent: agent as AgentId,
+      name,
+      digest: d,
+      ...(file ? { file: { path: value, readAt: now() } } : {}),
+    });
   }
 
   if (problems.length === 0 && entries.length === 0) {
@@ -118,17 +191,42 @@ export function authenticatorFromEnv(
     );
   }
 
+  /** Re-reads a token file whose last read is stale; a bad one admits nobody. */
+  const refresh = (entry: Entry, at: number) => {
+    const file = entry.file;
+    if (file === undefined || at - file.readAt < TOKEN_FILE_TTL_MS) return;
+    file.readAt = at;
+    const read = readTokenFile(file.path);
+    if ("problem" in read) {
+      if (entry.digest !== undefined)
+        console.error(
+          `${entry.name}: ${read.problem}; refusing agent ${entry.agent} until it is fixed`,
+        );
+      entry.digest = undefined;
+    } else {
+      entry.digest = digest(read.token);
+    }
+  };
+
   return {
     identify(token: string): AgentId | undefined {
+      const at = now();
+      for (const entry of entries) refresh(entry, at);
       // Compare digests, so every comparison is over equal-length buffers,
       // and visit every entry, so the time taken says nothing about which
-      // (if any) matched.
+      // (if any) matched. A token two agents hold after a rotation names
+      // neither.
       const presented = digest(token);
       let match: AgentId | undefined;
+      let matches = 0;
       for (const entry of entries) {
-        if (timingSafeEqual(presented, entry.digest)) match = entry.agent;
+        if (entry.digest === undefined) continue;
+        if (timingSafeEqual(presented, entry.digest)) {
+          match = entry.agent;
+          matches += 1;
+        }
       }
-      return match;
+      return matches === 1 ? match : undefined;
     },
   };
 }
